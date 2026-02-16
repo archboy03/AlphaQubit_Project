@@ -6,7 +6,7 @@ import numpy as np
 import pickle
 import os
 from model.model import CycleArchitecture  # Your architecture file
-from data_utils.generate_data import generate_training_data # Your data file
+from data_utils.generate_SI1000_data import generate_SI1000_training_data # Your data file
 
 # --- CONFIGURATION ---
 BATCH_SIZE = 32
@@ -36,7 +36,7 @@ def get_batch(batch_size=BATCH_SIZE):
     """
     # 1. Generate Raw Data
     # Returns: post_1, events_1, post_2, events_2, logical_errors
-    p1, e1, p2, e2, labels = generate_training_data(
+    p1, e1, p2, e2, labels = generate_SI1000_training_data(
         d=DISTANCE, 
         rounds=ROUNDS, 
         shots=batch_size, 
