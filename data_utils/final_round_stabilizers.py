@@ -6,7 +6,11 @@
 # However, we don't know which data qubits are which elements of the 9D array and then also how the stabilizer checks correspond to these measurments
 
 import numpy as np
-from config import Config 
+
+try:
+    from config_local import LocalConfig as Config
+except ImportError:
+    from config import Config
 
 config = Config()
 

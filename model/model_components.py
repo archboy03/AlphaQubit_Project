@@ -41,10 +41,12 @@ class SelfAttentionBlock(hk.Module):
 
 # --- 3. MOE LAYER ---
 class MixtureOfExpertsLayer(hk.Module):
+    """MoE with load-balancing auxiliary loss to prevent expert collapse."""
+
     def __init__(self, num_experts, expert_dim, name=None):
         super().__init__(name=name)
         self.num_experts = num_experts
-        self.expert_dim = expert_dim 
+        self.expert_dim = expert_dim
 
     def __call__(self, x):
         model_dim = x.shape[-1]
@@ -52,6 +54,12 @@ class MixtureOfExpertsLayer(hk.Module):
         # Router
         gate_logits = hk.Linear(self.num_experts)(x)
         gate_weights = jax.nn.softmax(gate_logits, axis=-1)
+
+        # Load-balancing auxiliary loss: penalize imbalanced expert usage.
+        # mean_gate_e = fraction of "tokens" routed to expert e.
+        # aux_loss = num_experts * sum_e(mean_gate_e^2); minimized when uniform (1/N each).
+        mean_gate = jnp.mean(gate_weights, axis=(0, 1))  # (num_experts,)
+        aux_loss = self.num_experts * jnp.sum(mean_gate ** 2)
 
         # Experts
         expert_outputs = []
@@ -64,12 +72,12 @@ class MixtureOfExpertsLayer(hk.Module):
             expert_outputs.append(expert_net(x))
 
         stacked_experts = jnp.stack(expert_outputs, axis=0)
-        
+
         # Weighted Combination
         # gate: [Batch, Stab, Exp], stack: [Exp, Batch, Stab, Dim]
         combined_output = jnp.einsum('bse,ebsd->bsd', gate_weights, stacked_experts)
-        
-        return combined_output
+
+        return combined_output, aux_loss
 
 
 # --- 4. SURFACE CODE CONV ---
@@ -143,42 +151,45 @@ class SyndromeTransformer(hk.Module):
         conv2D = SurfaceCodeConv(filters=self.model_dim, kernel_size=3, stride=1, distance=self.distance)
 
         # 1. Attention
-        x = attention_layer(x) 
-        
+        x = attention_layer(x)
+
         # 2. MoE (The "Dense" Block replacement)
-        x_moe = moe(x)
-        x = x + x_moe 
+        x_moe, aux_loss = moe(x)
+        x = x + x_moe
         x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
 
         # 3. Convolution (Spatial Context)
         x_conv = conv2D(x)
-        x = x + x_conv 
+        x = x + x_conv
         x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
 
-        return x
+        return x, aux_loss
 
 
 # --- 6. RNN CORE ---
 class RNN_core(hk.Module):
-    def __init__(self, mixing_mult, distance=3, name=None):
+    def __init__(self, mixing_mult, distance=3, num_layers=3, model_dim=64, name=None):
         super().__init__(name=name)
         self.mixing_mult = mixing_mult
         self.distance = distance
+        self.num_layers = num_layers
+        self.model_dim = model_dim
 
     def __call__(self, s, decoder_state):
         # Simple analog mixing of new inputs (s) and old memory (decoder_state)
-        # Both are 64D.
         x = self.mixing_mult * (s + decoder_state)
 
-        # Deep processing: Stack of 3 Transformers
-        # Haiku handles separate weights for each call automatically because
-        # we are creating new instances (or we could create a list of modules).
-        # To be safe and explicit in Haiku:
-        x = SyndromeTransformer(distance=self.distance, name="transformer_1")(x)
-        x = SyndromeTransformer(distance=self.distance, name="transformer_2")(x)
-        x = SyndromeTransformer(distance=self.distance, name="transformer_3")(x)
+        # Deep processing: Stack of N SyndromeTransformer layers
+        aux_total = 0.0
+        for i in range(self.num_layers):
+            x, aux = SyndromeTransformer(
+                model_dim=self.model_dim,
+                distance=self.distance,
+                name=f"transformer_{i+1}"
+            )(x)
+            aux_total = aux_total + aux
 
-        return x
+        return x, aux_total
 
 class ReadoutHead(hk.Module):
     def __init__(self, name=None):
