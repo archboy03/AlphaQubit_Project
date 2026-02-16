@@ -1,7 +1,51 @@
+# Personal config (contains local file paths)
+config_local.py
+
+# Data files
+data/ 
+*.b8
+*.dem
+*.stim
+
+# Checkpoints
+checkpoints/
+
+#Notebooks (just for testing code)
+notebooks/ 
+
+# Python
 __pycache__/
 .ipynb_checkpoints/
 *.pyc
+
+# OS
 .DS_Store
+Thumbs.db
+
 # Large data files
 *.npy
 *.npz
+
+# Virtual environments
+venv/
+.venv/
+
+# Packaging
+*.egg-info/
+dist/
+build/
+
+# Environment secrets
+.env
+
+# Experiment tracking / logs
+wandb/
+logs/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# To do list
+to_do.md

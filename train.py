@@ -6,7 +6,7 @@ import numpy as np
 import pickle
 import os
 from model.model import CycleArchitecture  # Your architecture file
-from data_utils.generate_SI1000_data import generate_SI1000_training_data # Your data file
+from data_generation_types.generate_SI1000_data import generate_SI1000_training_data
 
 # --- CONFIGURATION ---
 BATCH_SIZE = 32

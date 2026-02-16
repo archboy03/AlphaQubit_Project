@@ -1,0 +1,7 @@
+jax>=0.4.20
+jaxlib>=0.4.20
+dm-haiku>=0.0.12
+optax>=0.2.0
+numpy>=1.24.0
+scipy>=1.11.0
+stim>=1.13.0
