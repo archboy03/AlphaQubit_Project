@@ -88,8 +88,9 @@ class CurriculumDataLoader:
         e2_in = e2[:, :limit].reshape(batch_size, self.rounds, self.num_stabilizers)
 
         # 4. Stack Channels
+        # Order: (Events_1, Meas_1, Events_2, Meas_2) — consistent across SI1000, DEM, and hardware
         # Result: (Batch, Rounds, Stabilizers, 4)
-        syndromes = np.stack([p1_in, e1_in, p2_in, e2_in], axis=-1)
+        syndromes = np.stack([e1_in, p1_in, e2_in, p2_in], axis=-1)
         
         # Ensure labels are (Batch, Rounds, 1) and float32
         # SI1000: labels already (batch_size, rounds). DEM: (batch_size, 1) -> broadcast.
