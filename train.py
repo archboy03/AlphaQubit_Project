@@ -33,6 +33,11 @@ CHECKPOINT_EVERY = config.checkpoint_every
 LOG_EVERY = config.log_every
 HIDDEN_SIZE = config.hidden_size
 NUM_LAYERS = config.num_layers
+MIXING_MULT = config.mixing_mult
+USE_MOE = config.use_moe
+FFN_HIDDEN_DIM = config.ffn_hidden_dim
+MOE_NUM_EXPERTS = config.moe_num_experts
+MOE_EXPERT_DIM = config.moe_expert_dim
 
 # We need to know input features for the embedder
 # Your data provides 4 channels: Post_1, Event_1, Post_2, Event_2
@@ -52,10 +57,14 @@ def unroll_model(syndromes):
     """
     # Initialize the architecture
     cycle_model = CycleArchitecture(
-        mixing_mult=0.5,
+        mixing_mult=MIXING_MULT,
         output_size=HIDDEN_SIZE,
         distance=DISTANCE,
         num_layers=NUM_LAYERS,
+        use_moe=USE_MOE,
+        ffn_hidden_dim=FFN_HIDDEN_DIM,
+        moe_num_experts=MOE_NUM_EXPERTS,
+        moe_expert_dim=MOE_EXPERT_DIM,
     )
     
     # Initial Decoder State: (Batch, NUM_STABILIZERS, HIDDEN_SIZE)
@@ -75,15 +84,24 @@ def unroll_model(syndromes):
         logits_over_time.append(logit)
         aux_loss_total = aux_loss_total + aux_loss
 
-    return jnp.stack(logits_over_time, axis=1), aux_loss_total
+    num_rounds = syndromes.shape[1]
+    return jnp.stack(logits_over_time, axis=1), aux_loss_total / num_rounds
 
 # Create the pure functions
 network = hk.transform(unroll_model)
 
-# Optimizer with gradient clipping for transformer training stability
+# Optimizer with gradient clipping and linear LR warmup (then constant).
+# Cosine decay is harmful here: the curriculum already ramps difficulty, so the
+# LR must stay high enough for the model to keep adapting to harder data.
+warmup_steps = 500
+lr_schedule = optax.linear_schedule(
+    init_value=0.0,
+    end_value=LEARNING_RATE,
+    transition_steps=warmup_steps,
+)
 optimizer = optax.chain(
     optax.clip_by_global_norm(1.0),
-    optax.adam(LEARNING_RATE),
+    optax.adam(lr_schedule),
 )
 
 # MoE load-balancing auxiliary loss coefficient (prevents expert collapse)
@@ -93,14 +111,17 @@ AUX_LOSS_COEF = 0.01
 def loss_fn(params, rng, syndromes, targets):
     logits, aux_loss = network.apply(params, rng, syndromes)
     task_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(logits, targets))
-    return task_loss + AUX_LOSS_COEF * aux_loss
+    total_loss = task_loss + AUX_LOSS_COEF * aux_loss
+    return total_loss, (task_loss, AUX_LOSS_COEF * aux_loss)
 
 @jax.jit
 def update_step(params, opt_state, rng, syndromes, targets):
-    loss, grads = jax.value_and_grad(loss_fn)(params, rng, syndromes, targets)
+    (loss, (task_loss, aux_loss)), grads = jax.value_and_grad(loss_fn, has_aux=True)(
+        params, rng, syndromes, targets
+    )
     updates, new_opt_state = optimizer.update(grads, opt_state)
     new_params = optax.apply_updates(params, updates)
-    return new_params, new_opt_state, loss
+    return new_params, new_opt_state, loss, task_loss, aux_loss
 
 @jax.jit
 def eval_step(params, rng, syndromes, targets):
@@ -133,6 +154,16 @@ def load_checkpoint(path):
     print(f"  Checkpoint loaded from {path}")
     return checkpoint["params"], checkpoint["opt_state"], checkpoint["epoch"]
 
+
+def checkpoint_is_compatible(params, rng, sample_syndromes):
+    """Return True if params can run a forward pass for current architecture."""
+    try:
+        network.apply(params, rng, sample_syndromes)
+        return True
+    except Exception as err:
+        print(f"  Checkpoint incompatible with current model config: {type(err).__name__}: {err}")
+        return False
+
 # --- 5. MAIN TRAINING LOOP ---
 
 # Initialization
@@ -143,24 +174,19 @@ sample_input, sample_target = data_loader.get_batch(
 
 rng = jax.random.PRNGKey(42)
 start_epoch = 0
-
-# Try to resume from latest checkpoint
 latest_ckpt = os.path.join(CHECKPOINT_DIR, "latest.pkl")
-if os.path.exists(latest_ckpt):
-    print("Resuming from checkpoint...")
-    params, opt_state, start_epoch = load_checkpoint(latest_ckpt)
-    print(f"  Resuming from epoch {start_epoch}")
-    # Advance the RNG to match where we left off
-    for _ in range(start_epoch + 1):
-        rng, _ = jax.random.split(rng)
-else:
-    print("Initializing parameters from scratch...")
-    params = network.init(rng, sample_input)
-    opt_state = optimizer.init(params)
+
+# Always start pre-training from scratch for each invocation.
+init_mode = "fresh_train"
+init_source = "new_random_init"
+print("Initializing parameters from scratch...")
+params = network.init(rng, sample_input)
+opt_state = optimizer.init(params)
 
 print(f"Model initialized. Input shape: {sample_input.shape}")
 print(f"  distance={DISTANCE}, stabilizers={NUM_STABILIZERS}, rounds={ROUNDS}")
 print(f"  hidden_size={HIDDEN_SIZE}, num_layers={NUM_LAYERS}, mode={config.mode}")
+print(f"  init_mode={init_mode}, init_source={init_source}, start_epoch={start_epoch}")
 
 # TensorBoard writer — each run gets its own subdirectory
 run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -198,7 +224,7 @@ try:
         rng, step_rng = jax.random.split(rng)
         
         # 2. Update Weights
-        params, opt_state, loss_val = update_step(
+        params, opt_state, loss_val, task_loss_val, aux_loss_val = update_step(
             params, 
             opt_state, 
             step_rng, 
@@ -208,13 +234,13 @@ try:
         
         if epoch % LOG_EVERY == 0:
             loss_scalar = float(loss_val)
-            print(f"Epoch {epoch}: Loss = {loss_scalar:.4f}")
+            task_scalar = float(task_loss_val)
+            aux_scalar = float(aux_loss_val)
+            print(f"Epoch {epoch}: Loss = {loss_scalar:.4f} (task={task_scalar:.4f}, aux={aux_scalar:.4f})")
             writer.add_scalar("train/loss", loss_scalar, epoch)
+            writer.add_scalar("train/task_loss", task_scalar, epoch)
+            writer.add_scalar("train/aux_loss", aux_scalar, epoch)
 
-            # Log curriculum progress
-            progress = min(max(epoch / TOTAL_EPOCHS, 0.0), 1.0) if TOTAL_EPOCHS > 0 else 1.0
-            _, curr_p = data_loader._get_difficulty_params(progress)
-            writer.add_scalar("curriculum/physical_error_rate", curr_p, epoch)
             writer.flush()
 
         # 3. Evaluation on held-out data

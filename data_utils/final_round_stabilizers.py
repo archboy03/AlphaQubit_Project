@@ -28,7 +28,8 @@ def calculate_final_round_stabilizers(data_qubits, d = config.code_distance):
     stabilizers = d*d - 1   # Number of stabilizers
 
     num_shots = data_qubits.shape[0]
-    stabilizer_values = np.full((num_shots, stabilizers), -1, dtype=data_qubits.dtype)   # Default -1 for X measurements
+    # Use 0.5 (max uncertainty) for X-type stabilizers - model expects [0,1]; -1 would be out-of-distribution
+    stabilizer_values = np.full((num_shots, stabilizers), 0.5, dtype=data_qubits.dtype)
 
     for z, idxs in code_z_structure.items():
         stabilizer_values[:, z-1] = np.sum(data_qubits[:, idxs], axis=1) % 2   # Parity of data qubit measurements

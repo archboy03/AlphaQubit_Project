@@ -136,26 +136,47 @@ class SurfaceCodeConv(hk.Module):
 
 # --- 5. MAIN TRANSFORMER (The Fix is Here) ---
 class SyndromeTransformer(hk.Module):
-    def __init__(self, model_dim=64, distance=3, name=None):
+    def __init__(
+        self,
+        model_dim=64,
+        distance=3,
+        use_moe=False,
+        ffn_hidden_dim=128,
+        moe_num_experts=4,
+        moe_expert_dim=128,
+        name=None,
+    ):
         super().__init__(name=name)
         self.model_dim = model_dim
         self.distance = distance
+        self.use_moe = use_moe
+        self.ffn_hidden_dim = ffn_hidden_dim
+        self.moe_num_experts = moe_num_experts
+        self.moe_expert_dim = moe_expert_dim
 
     def __call__(self, x):
-        # ERROR FIXED: Removed StabilizerEmbedder from here.
-        # Input 'x' is already 64D from the RNN_core.
-
-        # Instantiate Layers
-        moe = MixtureOfExpertsLayer(num_experts=4, expert_dim=128)
         attention_layer = SelfAttentionBlock(num_heads=4, key_size=16, model_size=self.model_dim)
         conv2D = SurfaceCodeConv(filters=self.model_dim, kernel_size=3, stride=1, distance=self.distance)
 
         # 1. Attention
         x = attention_layer(x)
 
-        # 2. MoE (The "Dense" Block replacement)
-        x_moe, aux_loss = moe(x)
-        x = x + x_moe
+        # 2. Feed-forward block (dense by default; optional MoE)
+        if self.use_moe:
+            moe = MixtureOfExpertsLayer(
+                num_experts=self.moe_num_experts,
+                expert_dim=self.moe_expert_dim,
+            )
+            x_ffn, aux_loss = moe(x)
+        else:
+            dense_block = hk.Sequential([
+                hk.Linear(self.ffn_hidden_dim),
+                jax.nn.relu,
+                hk.Linear(self.model_dim),
+            ])
+            x_ffn = dense_block(x)
+            aux_loss = jnp.array(0.0, dtype=x.dtype)
+        x = x + x_ffn
         x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
 
         # 3. Convolution (Spatial Context)
@@ -168,15 +189,30 @@ class SyndromeTransformer(hk.Module):
 
 # --- 6. RNN CORE ---
 class RNN_core(hk.Module):
-    def __init__(self, mixing_mult, distance=3, num_layers=3, model_dim=64, name=None):
+    def __init__(
+        self,
+        mixing_mult,
+        distance=3,
+        num_layers=3,
+        model_dim=64,
+        use_moe=False,
+        ffn_hidden_dim=128,
+        moe_num_experts=4,
+        moe_expert_dim=128,
+        name=None,
+    ):
         super().__init__(name=name)
         self.mixing_mult = mixing_mult
         self.distance = distance
         self.num_layers = num_layers
         self.model_dim = model_dim
+        self.use_moe = use_moe
+        self.ffn_hidden_dim = ffn_hidden_dim
+        self.moe_num_experts = moe_num_experts
+        self.moe_expert_dim = moe_expert_dim
 
     def __call__(self, s, decoder_state):
-        # Simple analog mixing of new inputs (s) and old memory (decoder_state)
+        # Fixed paper-style scaled sum mixing.
         x = self.mixing_mult * (s + decoder_state)
 
         # Deep processing: Stack of N SyndromeTransformer layers
@@ -185,11 +221,15 @@ class RNN_core(hk.Module):
             x, aux = SyndromeTransformer(
                 model_dim=self.model_dim,
                 distance=self.distance,
+                use_moe=self.use_moe,
+                ffn_hidden_dim=self.ffn_hidden_dim,
+                moe_num_experts=self.moe_num_experts,
+                moe_expert_dim=self.moe_expert_dim,
                 name=f"transformer_{i+1}"
             )(x)
             aux_total = aux_total + aux
 
-        return x, aux_total
+        return x, aux_total / self.num_layers
 
 class ReadoutHead(hk.Module):
     def __init__(self, name=None):

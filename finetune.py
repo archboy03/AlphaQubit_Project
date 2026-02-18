@@ -25,6 +25,11 @@ DISTANCE = config.code_distance
 HIDDEN_SIZE = config.hidden_size
 NUM_LAYERS = config.num_layers
 NUM_STABILIZERS = DISTANCE ** 2 - 1
+MIXING_MULT = config.mixing_mult
+USE_MOE = config.use_moe
+FFN_HIDDEN_DIM = config.ffn_hidden_dim
+MOE_NUM_EXPERTS = config.moe_num_experts
+MOE_EXPERT_DIM = config.moe_expert_dim
 
 BATCH_SIZE = config.finetune_batch_size
 LEARNING_RATE = config.finetune_lr
@@ -60,10 +65,14 @@ def unroll_model(syndromes):
     Returns: (Batch, Rounds, 1), aux_loss
     """
     cycle_model = CycleArchitecture(
-        mixing_mult=0.5,
+        mixing_mult=MIXING_MULT,
         output_size=HIDDEN_SIZE,
         distance=DISTANCE,
         num_layers=NUM_LAYERS,
+        use_moe=USE_MOE,
+        ffn_hidden_dim=FFN_HIDDEN_DIM,
+        moe_num_experts=MOE_NUM_EXPERTS,
+        moe_expert_dim=MOE_EXPERT_DIM,
     )
 
     batch_size = syndromes.shape[0]
@@ -78,43 +87,61 @@ def unroll_model(syndromes):
         logits_over_time.append(logit)
         aux_loss_total = aux_loss_total + aux_loss
 
-    return jnp.stack(logits_over_time, axis=1), aux_loss_total
+    num_rounds = syndromes.shape[1]
+    return jnp.stack(logits_over_time, axis=1), aux_loss_total / num_rounds
 
 
 network = hk.transform(unroll_model)
 
-# Optimizer: AdamW (weight decay for regularization) + gradient clipping
+# Optimizer: AdamW (weight decay for regularization) + gradient clipping + LR warmup
+warmup_steps = 200
+lr_schedule = optax.linear_schedule(
+    init_value=0.0,
+    end_value=LEARNING_RATE,
+    transition_steps=warmup_steps,
+)
 optimizer = optax.chain(
     optax.clip_by_global_norm(1.0),
-    optax.adamw(LEARNING_RATE, weight_decay=WEIGHT_DECAY),
+    optax.adamw(lr_schedule, weight_decay=WEIGHT_DECAY),
 )
 
 
 # --- 3. LOSS & UPDATE FUNCTIONS ---
+def extract_final_targets(targets):
+    """Use only the final-round observable for fine-tuning."""
+    return targets[:, -1, :]
+
+
 def loss_fn(params, rng, syndromes, targets):
     logits, aux_loss = network.apply(params, rng, syndromes)
-    task_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(logits, targets))
-    return task_loss + AUX_LOSS_COEF * aux_loss
+    final_logits = logits[:, -1, :]
+    final_targets = extract_final_targets(targets)
+    task_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(final_logits, final_targets))
+    total_loss = task_loss + AUX_LOSS_COEF * aux_loss
+    return total_loss, (task_loss, AUX_LOSS_COEF * aux_loss)
 
 
 @jax.jit
 def update_step(params, opt_state, rng, syndromes, targets):
-    loss, grads = jax.value_and_grad(loss_fn)(params, rng, syndromes, targets)
+    (loss, (task_loss, aux_loss)), grads = jax.value_and_grad(loss_fn, has_aux=True)(
+        params, rng, syndromes, targets
+    )
     updates, new_opt_state = optimizer.update(grads, opt_state, params)
     new_params = optax.apply_updates(params, updates)
-    return new_params, new_opt_state, loss
+    return new_params, new_opt_state, loss, task_loss, aux_loss
 
 
 @jax.jit
 def eval_step(params, rng, syndromes, targets):
-    """Compute loss and accuracy on a batch without gradient updates."""
+    """Compute final-round loss and accuracy on a batch."""
     logits, aux_loss = network.apply(params, rng, syndromes)
-    task_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(logits, targets))
+    final_logits = logits[:, -1, :]
+    final_targets = extract_final_targets(targets)
+    task_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(final_logits, final_targets))
     loss = task_loss + AUX_LOSS_COEF * aux_loss
-    predictions = (jax.nn.sigmoid(logits) > 0.5).astype(jnp.float32)
-    mean_accuracy = jnp.mean(predictions == targets)
-    final_accuracy = jnp.mean(predictions[:, -1, :] == targets[:, -1, :])
-    return loss, mean_accuracy, final_accuracy
+    predictions = (jax.nn.sigmoid(final_logits) > 0.5).astype(jnp.float32)
+    final_accuracy = jnp.mean(predictions == final_targets)
+    return loss, final_accuracy
 
 
 # --- 4. CHECKPOINTING ---
@@ -131,6 +158,16 @@ def load_checkpoint(path):
         checkpoint = pickle.load(f)
     print(f"  Checkpoint loaded from {path}")
     return checkpoint["params"], checkpoint["opt_state"], checkpoint["epoch"]
+
+
+def checkpoint_is_compatible(params, rng, sample_syndromes):
+    """Return True if params can run a forward pass for current architecture."""
+    try:
+        network.apply(params, rng, sample_syndromes)
+        return True
+    except Exception as err:
+        print(f"  Checkpoint incompatible with current model config: {type(err).__name__}: {err}")
+        return False
 
 
 # --- 5. ROUND-COUNT CURRICULUM ---
@@ -176,7 +213,7 @@ def run_validation(params, rng, val_loader, round_counts):
             chunk_size = end - start
             syndromes, targets = val_loader.get_batch(chunk_size, r)
             rng, eval_rng = jax.random.split(rng)
-            loss, mean_acc, final_acc = eval_step(params, eval_rng, syndromes, targets)
+            loss, final_acc = eval_step(params, eval_rng, syndromes, targets)
 
             round_losses.append(float(loss) * chunk_size)
             round_final_correct += int(float(final_acc) * chunk_size)
@@ -199,28 +236,44 @@ def run_validation(params, rng, val_loader, round_counts):
 # --- 7. INITIALIZATION ---
 rng = jax.random.PRNGKey(42)
 start_step = 0
+min_r = min(FINETUNE_ROUNDS)
+dummy_syndromes, _ = train_loader.get_batch(2, min_r)
+params = None
+opt_state = None
+init_mode = "load_pretrained"
+init_source = "unset"
 
-# Try to resume from a fine-tuning checkpoint first
+# Always start a fresh fine-tuning run (step 0) from pre-training checkpoints.
 ft_latest_ckpt = os.path.join(CHECKPOINT_DIR, "finetuned_latest.pkl")
-if os.path.exists(ft_latest_ckpt):
-    print("\nResuming fine-tuning from checkpoint...")
-    params, opt_state, start_step = load_checkpoint(ft_latest_ckpt)
-    print(f"  Resuming from step {start_step}")
-    for _ in range(start_step + 1):
-        rng, _ = jax.random.split(rng)
-elif os.path.exists(PRETRAINED_CKPT):
-    print(f"\nLoading pre-trained weights from {PRETRAINED_CKPT}...")
-    params, _, _ = load_checkpoint(PRETRAINED_CKPT)
-    # Fresh optimizer state for fine-tuning
-    opt_state = optimizer.init(params)
-    print("  Pre-trained weights loaded. Optimizer state initialized fresh.")
-else:
-    print("\nNo pre-trained checkpoint found. Initializing from scratch...")
-    # Need a dummy input to initialize the model -- use the smallest round count
-    min_r = min(FINETUNE_ROUNDS)
-    dummy_syndromes, _ = train_loader.get_batch(2, min_r)
-    params = network.init(rng, dummy_syndromes)
-    opt_state = optimizer.init(params)
+print("\nLoading pre-training checkpoint for fresh fine-tuning run (latest-first)...")
+pretrain_candidates = [
+    os.path.join(CHECKPOINT_DIR, "latest.pkl"),
+    os.path.join(CHECKPOINT_DIR, "best.pkl"),
+    PRETRAINED_CKPT,
+]
+seen = set()
+for candidate in pretrain_candidates:
+    if candidate in seen:
+        continue
+    seen.add(candidate)
+    if not os.path.exists(candidate):
+        continue
+    print(f"  Checking pretrain checkpoint: {candidate}")
+    loaded_params, _, _ = load_checkpoint(candidate)
+    if checkpoint_is_compatible(loaded_params, rng, dummy_syndromes):
+        params = loaded_params
+        opt_state = optimizer.init(params)  # Fresh optimizer state for fine-tuning
+        start_step = 0
+        init_source = candidate
+        print("  Compatible pre-trained weights loaded. Optimizer state initialized fresh.")
+        break
+    print("  Incompatible pretrain checkpoint, trying next candidate.")
+
+if params is None:
+    raise SystemExit(
+        "ERROR: No compatible pre-training checkpoint found. "
+        "Run `python train.py` first, then run `python finetune.py`."
+    )
 
 print(f"\nFine-tuning configuration:")
 print(f"  distance={DISTANCE}, stabilizers={NUM_STABILIZERS}")
@@ -228,6 +281,7 @@ print(f"  hidden_size={HIDDEN_SIZE}, num_layers={NUM_LAYERS}")
 print(f"  learning_rate={LEARNING_RATE}, weight_decay={WEIGHT_DECAY}, batch_size={BATCH_SIZE}")
 print(f"  total_steps={TOTAL_STEPS}, early_stopping_patience={EARLY_STOPPING_PATIENCE}")
 print(f"  round_counts={FINETUNE_ROUNDS}")
+print(f"  init_mode={init_mode}, init_source={init_source}, start_step={start_step}")
 
 # --- 8. TENSORBOARD ---
 run_name = "finetune_" + datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -268,15 +322,19 @@ try:
 
         # 3. Update weights
         rng, step_rng = jax.random.split(rng)
-        params, opt_state, loss_val = update_step(
+        params, opt_state, loss_val, task_loss_val, aux_loss_val = update_step(
             params, opt_state, step_rng, syndromes, targets
         )
 
         # 4. Logging
         if step % LOG_EVERY == 0:
             loss_scalar = float(loss_val)
-            print(f"Step {step}: Loss = {loss_scalar:.4f} (r={r})")
+            task_scalar = float(task_loss_val)
+            aux_scalar = float(aux_loss_val)
+            print(f"Step {step}: Loss = {loss_scalar:.4f} (task={task_scalar:.4f}, aux={aux_scalar:.4f}, r={r})")
             writer.add_scalar("finetune/loss", loss_scalar, step)
+            writer.add_scalar("finetune/task_loss", task_scalar, step)
+            writer.add_scalar("finetune/aux_loss", aux_scalar, step)
             writer.add_scalar("finetune/round_count", r, step)
             writer.flush()
 
@@ -286,6 +344,17 @@ try:
                 params, rng, val_loader, FINETUNE_ROUNDS
             )
             print(f"  [EVAL] Step {step}: Loss = {agg_loss:.4f}, Final Acc = {agg_final_acc:.4f}")
+            if per_round:
+                eval_rounds = sorted(per_round.keys())
+                low_r = eval_rounds[0]
+                mid_r = eval_rounds[len(eval_rounds) // 2]
+                high_r = eval_rounds[-1]
+                print(
+                    "  [EVAL-R] "
+                    f"r{low_r:02d}={per_round[low_r]['final_accuracy']:.4f}, "
+                    f"r{mid_r:02d}={per_round[mid_r]['final_accuracy']:.4f}, "
+                    f"r{high_r:02d}={per_round[high_r]['final_accuracy']:.4f}"
+                )
 
             writer.add_scalar("eval/loss", agg_loss, step)
             writer.add_scalar("eval/final_accuracy", agg_final_acc, step)

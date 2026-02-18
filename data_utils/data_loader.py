@@ -24,19 +24,20 @@ class CurriculumDataLoader:
         # DEM Curriculum: Scale factor f from 0.5 to 1.0 (Training details -> Sycamore data)
         self.dem_min_f = 0.5
         self.dem_max_f = 1.0
-        
-        # SI1000 Curriculum: Physical error p from 0.001 to 0.005 (Example range)
-        # Note: Adjust these p values based on what your generate_SI1000_data expects
-        self.si_min_p = 0.001
-        self.si_max_p = 0.005
+
+        # SI1000 Curriculum: Physical error p (from config for easier tuning)
+        self.si_min_p = getattr(config, "si_min_p", 0.001)
+        self.si_max_p = getattr(config, "si_max_p", 0.01)
 
     def _get_difficulty_params(self, progress):
         """
-        Calculates current noise parameters based on training progress (0.0 to 1.0).
+        Randomly sample noise parameters uniformly from the configured range.
+        Each batch sees a different difficulty, so the model learns to decode
+        across all noise levels simultaneously -- preventing catastrophic forgetting
+        that occurs with a linear curriculum ramp.
         """
-        # Linear ramp is a simple, effective approximation of the curriculum 
-        current_f = self.dem_min_f + (self.dem_max_f - self.dem_min_f) * progress
-        current_p = self.si_min_p + (self.si_max_p - self.si_min_p) * progress
+        current_f = np.random.uniform(self.dem_min_f, self.dem_max_f)
+        current_p = np.random.uniform(self.si_min_p, self.si_max_p)
         return current_f, current_p
 
     def get_batch(self, batch_size, epoch, total_epochs):

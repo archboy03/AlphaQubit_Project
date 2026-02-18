@@ -146,7 +146,16 @@ class HardwareDataLoader:
         p2 = np.zeros_like(p1)
         e2 = np.zeros_like(p1)
 
+        # Optional: soften binary inputs to better match SI1000's continuous [0,1] distribution.
+        # Pre-training uses soft posteriors; hardware gives binary 0/1. Softening reduces distribution shift.
+        softening = getattr(self.config, "finetune_input_softening", 0.0)
+        if softening > 0:
+            eps = softening
+            p1 = p1 * (1 - 2 * eps) + eps
+            e1 = e1 * (1 - 2 * eps) + eps
+
         # Stack into (B, R, S, 4)
+        # Channel order: [Event/det_events, Post/measurements, Event2, Post2] - matches CurriculumDataLoader
         syndromes = np.stack([p1, e1, p2, e2], axis=-1)
 
         # Broadcast single observable label to all rounds: (B, R, 1)

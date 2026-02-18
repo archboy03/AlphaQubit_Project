@@ -9,6 +9,7 @@ data/
 
 # Checkpoints
 checkpoints/
+runs/
 
 #Notebooks (just for testing code)
 notebooks/ 

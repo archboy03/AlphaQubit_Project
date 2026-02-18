@@ -22,6 +22,11 @@ DISTANCE = config.code_distance
 HIDDEN_SIZE = config.hidden_size
 NUM_LAYERS = config.num_layers
 NUM_STABILIZERS = DISTANCE ** 2 - 1
+MIXING_MULT = config.mixing_mult
+USE_MOE = config.use_moe
+FFN_HIDDEN_DIM = config.ffn_hidden_dim
+MOE_NUM_EXPERTS = config.moe_num_experts
+MOE_EXPERT_DIM = config.moe_expert_dim
 
 TEST_ROUND = config.test_round
 CHECKPOINT_DIR = config.checkpoint_dir
@@ -38,10 +43,14 @@ def unroll_model(syndromes):
     Returns: (Batch, Rounds, 1), aux_loss
     """
     cycle_model = CycleArchitecture(
-        mixing_mult=0.5,
+        mixing_mult=MIXING_MULT,
         output_size=HIDDEN_SIZE,
         distance=DISTANCE,
         num_layers=NUM_LAYERS,
+        use_moe=USE_MOE,
+        ffn_hidden_dim=FFN_HIDDEN_DIM,
+        moe_num_experts=MOE_NUM_EXPERTS,
+        moe_expert_dim=MOE_EXPERT_DIM,
     )
 
     batch_size = syndromes.shape[0]
@@ -56,7 +65,8 @@ def unroll_model(syndromes):
         logits_over_time.append(logit)
         aux_loss_total = aux_loss_total + aux_loss
 
-    return jnp.stack(logits_over_time, axis=1), aux_loss_total
+    num_rounds = syndromes.shape[1]
+    return jnp.stack(logits_over_time, axis=1), aux_loss_total / num_rounds
 
 
 network = hk.transform(unroll_model)
@@ -67,6 +77,17 @@ def load_checkpoint(path):
         checkpoint = pickle.load(f)
     print(f"  Checkpoint loaded from {path}")
     return checkpoint["params"], checkpoint["opt_state"], checkpoint["epoch"]
+
+
+def checkpoint_is_compatible(params, rng):
+    """Return True if params can run a forward pass for current architecture."""
+    dummy_syndromes = jnp.zeros((2, TEST_ROUND, NUM_STABILIZERS, 4), dtype=jnp.float32)
+    try:
+        network.apply(params, rng, dummy_syndromes)
+        return True
+    except Exception as err:
+        print(f"  Checkpoint incompatible with current model config: {type(err).__name__}: {err}")
+        return False
 
 
 @jax.jit
@@ -91,6 +112,13 @@ def format_test_data(det_events, measurements, obs_flips, rounds, batch_size):
     p2 = np.zeros_like(p1)
     e2 = np.zeros_like(p1)
 
+    # Soften binary inputs to match SI1000 distribution (if configured)
+    softening = getattr(config, "finetune_input_softening", 0.0)
+    if softening > 0:
+        eps = softening
+        p1 = p1 * (1 - 2 * eps) + eps
+        e1 = e1 * (1 - 2 * eps) + eps
+
     syndromes = np.stack([p1, e1, p2, e2], axis=-1)
     labels = np.broadcast_to(
         obs_flips.reshape(batch_size, 1, 1),
@@ -108,23 +136,31 @@ def main():
     print(f"  Code distance: {DISTANCE}")
     print("=" * 60)
 
-    # Load fine-tuned checkpoint (prefer finetuned_best, fall back to best)
-    ft_best = os.path.join(CHECKPOINT_DIR, "finetuned_best.pkl")
+    # Load a compatible checkpoint (prefer latest checkpoints first)
     ft_latest = os.path.join(CHECKPOINT_DIR, "finetuned_latest.pkl")
+    ft_best = os.path.join(CHECKPOINT_DIR, "finetuned_best.pkl")
+    pre_latest = os.path.join(CHECKPOINT_DIR, "latest.pkl")
     pretrained = os.path.join(CHECKPOINT_DIR, "best.pkl")
 
+    rng = jax.random.PRNGKey(0)
     ckpt_path = None
-    for candidate in [ft_best, ft_latest, pretrained]:
-        if os.path.exists(candidate):
+    params = None
+    for candidate in [ft_latest, ft_best, pre_latest, pretrained]:
+        if not os.path.exists(candidate):
+            continue
+        print(f"\nChecking checkpoint candidate: {candidate}")
+        loaded_params, _, _ = load_checkpoint(candidate)
+        if checkpoint_is_compatible(loaded_params, rng):
             ckpt_path = candidate
+            params = loaded_params
             break
+        print("  Skipping incompatible checkpoint and trying next fallback.")
 
-    if ckpt_path is None:
-        print("ERROR: No checkpoint found. Run train.py or finetune.py first.")
+    if ckpt_path is None or params is None:
+        print("ERROR: No compatible checkpoint found. Run train.py/finetune.py with current config.")
         return
 
-    print(f"\nLoading checkpoint: {ckpt_path}")
-    params, _, _ = load_checkpoint(ckpt_path)
+    print(f"\nUsing checkpoint: {ckpt_path}")
 
     # Load test data
     print(f"\nLoading test data (r={TEST_ROUND:02d})...")
@@ -138,7 +174,6 @@ def main():
 
     # Run model predictions in batches
     print("\nRunning model inference...")
-    rng = jax.random.PRNGKey(0)
     all_final_preds = []
 
     for start in range(0, num_shots, EVAL_BATCH_SIZE):
