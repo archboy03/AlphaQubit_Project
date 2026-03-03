@@ -31,53 +31,28 @@ class SelfAttentionBlock(hk.Module):
             w_init=hk.initializers.VarianceScaling(1.0)
         )
         
-        # Pre-Norm architecture (often more stable for deep transformers)
-        # But Post-Norm (your style) is also fine. Keeping your style:
-        attn_out = attention_layer(query=x, key=x, value=x, mask=mask)
+        # Pre-Norm: normalize before attention for better gradient flow
+        x_norm = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
+        attn_out = attention_layer(query=x_norm, key=x_norm, value=x_norm, mask=mask)
         x = x + attn_out
-        x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
         return x
 
 
-# --- 3. MOE LAYER ---
-class MixtureOfExpertsLayer(hk.Module):
-    """MoE with load-balancing auxiliary loss to prevent expert collapse."""
+# --- 3. FFN BLOCK ---
+class FFNBlock(hk.Module):
+    """Standard feed-forward network block (transformer-style). No auxiliary loss."""
 
-    def __init__(self, num_experts, expert_dim, name=None):
+    def __init__(self, model_dim, expansion_factor=4, name=None):
         super().__init__(name=name)
-        self.num_experts = num_experts
-        self.expert_dim = expert_dim
+        self.model_dim = model_dim
+        self.intermediate_dim = model_dim * expansion_factor
 
     def __call__(self, x):
-        model_dim = x.shape[-1]
-
-        # Router
-        gate_logits = hk.Linear(self.num_experts)(x)
-        gate_weights = jax.nn.softmax(gate_logits, axis=-1)
-
-        # Load-balancing auxiliary loss: penalize imbalanced expert usage.
-        # mean_gate_e = fraction of "tokens" routed to expert e.
-        # aux_loss = num_experts * sum_e(mean_gate_e^2); minimized when uniform (1/N each).
-        mean_gate = jnp.mean(gate_weights, axis=(0, 1))  # (num_experts,)
-        aux_loss = self.num_experts * jnp.sum(mean_gate ** 2)
-
-        # Experts
-        expert_outputs = []
-        for i in range(self.num_experts):
-            expert_net = hk.Sequential([
-                hk.Linear(self.expert_dim),
-                jax.nn.relu,
-                hk.Linear(model_dim)
-            ])
-            expert_outputs.append(expert_net(x))
-
-        stacked_experts = jnp.stack(expert_outputs, axis=0)
-
-        # Weighted Combination
-        # gate: [Batch, Stab, Exp], stack: [Exp, Batch, Stab, Dim]
-        combined_output = jnp.einsum('bse,ebsd->bsd', gate_weights, stacked_experts)
-
-        return combined_output, aux_loss
+        # x: (batch, num_stabilizers, model_dim)
+        out = hk.Linear(self.intermediate_dim)(x)
+        out = jax.nn.relu(out)
+        out = hk.Linear(self.model_dim)(out)
+        return out
 
 
 # --- 4. SURFACE CODE CONV ---
@@ -134,7 +109,7 @@ class SurfaceCodeConv(hk.Module):
         return out
 
 
-# --- 5. MAIN TRANSFORMER (The Fix is Here) ---
+# --- 5. MAIN TRANSFORMER ---
 class SyndromeTransformer(hk.Module):
     def __init__(self, model_dim=64, distance=3, name=None):
         super().__init__(name=name)
@@ -142,28 +117,25 @@ class SyndromeTransformer(hk.Module):
         self.distance = distance
 
     def __call__(self, x):
-        # ERROR FIXED: Removed StabilizerEmbedder from here.
-        # Input 'x' is already 64D from the RNN_core.
+        # Input 'x' is already model_dim from the RNN_core.
 
         # Instantiate Layers
-        moe = MixtureOfExpertsLayer(num_experts=4, expert_dim=128)
         attention_layer = SelfAttentionBlock(num_heads=4, key_size=16, model_size=self.model_dim)
         conv2D = SurfaceCodeConv(filters=self.model_dim, kernel_size=3, stride=1, distance=self.distance)
 
-        # 1. Attention
+        # 1. Attention (pre-norm is inside SelfAttentionBlock)
         x = attention_layer(x)
 
-        # 2. MoE (The "Dense" Block replacement)
-        x_moe, aux_loss = moe(x)
-        x = x + x_moe
-        x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
+        # 2. FFN block with pre-norm and residual
+        ffn = FFNBlock(model_dim=self.model_dim, expansion_factor=4)
+        x_norm = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
+        x = x + ffn(x_norm)
 
-        # 3. Convolution (Spatial Context)
-        x_conv = conv2D(x)
-        x = x + x_conv
-        x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
+        # 3. Convolution with pre-norm and residual
+        x_norm = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
+        x = x + conv2D(x_norm)
 
-        return x, aux_loss
+        return x
 
 
 # --- 6. RNN CORE ---
@@ -176,20 +148,22 @@ class RNN_core(hk.Module):
         self.model_dim = model_dim
 
     def __call__(self, s, decoder_state):
-        # Simple analog mixing of new inputs (s) and old memory (decoder_state)
-        x = self.mixing_mult * (s + decoder_state)
+        # GRU-style gated state update for stable gradient flow over many rounds
+        # Gate decides how much new input to incorporate vs carrying forward state
+        combined = jnp.concatenate([s, decoder_state], axis=-1)  # (B, S, 2*model_dim)
+        gate = jax.nn.sigmoid(hk.Linear(self.model_dim, name="gate")(combined))  # (B, S, model_dim)
+        
+        # Gated mixing: gate=1 → use new input, gate=0 → carry old state
+        x = gate * s + (1 - gate) * decoder_state
 
         # Deep processing: Stack of N SyndromeTransformer layers
-        aux_total = 0.0
         for i in range(self.num_layers):
-            x, aux = SyndromeTransformer(
+            x = SyndromeTransformer(
                 model_dim=self.model_dim,
                 distance=self.distance,
                 name=f"transformer_{i+1}"
             )(x)
-            aux_total = aux_total + aux
-
-        return x, aux_total
+        return x
 
 class ReadoutHead(hk.Module):
     def __init__(self, name=None):

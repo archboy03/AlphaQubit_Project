@@ -2,12 +2,12 @@ import jax
 import jax.numpy as jnp
 import haiku as hk
 import optax
-import numpy as np
 import pickle
 import os
 import subprocess
 import atexit
 import signal
+import shutil
 from datetime import datetime
 from tensorboardX import SummaryWriter
 from model.model import CycleArchitecture
@@ -33,6 +33,8 @@ CHECKPOINT_EVERY = config.checkpoint_every
 LOG_EVERY = config.log_every
 HIDDEN_SIZE = config.hidden_size
 NUM_LAYERS = config.num_layers
+POSITIVE_CLASS_WEIGHT = config.positive_class_weight
+FINAL_ROUND_WEIGHT = config.final_round_loss_weight
 
 # We need to know input features for the embedder
 # Your data provides 4 channels: Post_1, Event_1, Post_2, Event_2
@@ -63,7 +65,6 @@ def unroll_model(syndromes):
     d_state = jnp.zeros((batch_size, NUM_STABILIZERS, HIDDEN_SIZE))
     
     logits_over_time = []
-    aux_loss_total = 0.0
 
     # Loop over time
     for t in range(syndromes.shape[1]):
@@ -71,29 +72,40 @@ def unroll_model(syndromes):
         current_check = syndromes[:, t, :, :]
 
         # Run RNN step
-        d_state, logit, aux_loss = cycle_model(current_check, d_state)
+        d_state, logit = cycle_model(current_check, d_state)
         logits_over_time.append(logit)
-        aux_loss_total = aux_loss_total + aux_loss
 
-    return jnp.stack(logits_over_time, axis=1), aux_loss_total
+    return jnp.stack(logits_over_time, axis=1)
 
 # Create the pure functions
 network = hk.transform(unroll_model)
 
-# Optimizer with gradient clipping for transformer training stability
+# Optimizer with gradient clipping and LR warmup for transformer training stability
+WARMUP_STEPS = 1000
+lr_schedule = optax.linear_schedule(
+    init_value=0.0,
+    end_value=LEARNING_RATE,
+    transition_steps=WARMUP_STEPS,
+)
 optimizer = optax.chain(
     optax.clip_by_global_norm(1.0),
-    optax.adam(LEARNING_RATE),
+    optax.adam(lr_schedule),
 )
-
-# MoE load-balancing auxiliary loss coefficient (prevents expert collapse)
-AUX_LOSS_COEF = 0.01
 
 # --- 3. LOSS & UPDATE FUNCTIONS ---
 def loss_fn(params, rng, syndromes, targets):
-    logits, aux_loss = network.apply(params, rng, syndromes)
-    task_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(logits, targets))
-    return task_loss + AUX_LOSS_COEF * aux_loss
+    logits = network.apply(params, rng, syndromes)
+    raw_bce = optax.sigmoid_binary_cross_entropy(logits, targets)
+
+    # Class weighting: up-weight the positive (error) class to combat imbalance
+    class_weights = jnp.where(targets == 1.0, POSITIVE_CLASS_WEIGHT, 1.0)
+
+    # Final-round weighting: emphasize the last round (the actual decoding target)
+    round_weights = jnp.ones_like(raw_bce)
+    round_weights = round_weights.at[:, -1, :].set(FINAL_ROUND_WEIGHT)
+
+    loss = jnp.mean(raw_bce * class_weights * round_weights)
+    return loss
 
 @jax.jit
 def update_step(params, opt_state, rng, syndromes, targets):
@@ -105,13 +117,17 @@ def update_step(params, opt_state, rng, syndromes, targets):
 @jax.jit
 def eval_step(params, rng, syndromes, targets):
     """Compute loss and accuracy on a batch without gradient updates."""
-    logits, aux_loss = network.apply(params, rng, syndromes)  # (B, R, 1)
-    task_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(logits, targets))
-    loss = task_loss + AUX_LOSS_COEF * aux_loss
-    predictions = (jax.nn.sigmoid(logits) > 0.5).astype(jnp.float32)
+    logits = network.apply(params, rng, syndromes)  # (B, R, 1)
+    loss = jnp.mean(optax.sigmoid_binary_cross_entropy(logits, targets))
+    probs = jax.nn.sigmoid(logits)
+    predictions = (probs > 0.5).astype(jnp.float32)
     mean_accuracy = jnp.mean(predictions == targets)
     final_accuracy = jnp.mean(predictions[:, -1, :] == targets[:, -1, :])
-    return loss, mean_accuracy, final_accuracy
+    # Prediction distribution stats for collapse detection
+    prob_mean = jnp.mean(probs)
+    prob_std = jnp.std(probs)
+    frac_positive = jnp.mean(predictions)
+    return loss, mean_accuracy, final_accuracy, prob_mean, prob_std, frac_positive
 
 # --- 4. CHECKPOINTING ---
 def save_checkpoint(params, opt_state, epoch, path):
@@ -162,27 +178,49 @@ print(f"Model initialized. Input shape: {sample_input.shape}")
 print(f"  distance={DISTANCE}, stabilizers={NUM_STABILIZERS}, rounds={ROUNDS}")
 print(f"  hidden_size={HIDDEN_SIZE}, num_layers={NUM_LAYERS}, mode={config.mode}")
 
-# TensorBoard writer — each run gets its own subdirectory
-run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
-run_log_dir = os.path.join(config.tensorboard_dir, run_name)
-writer = SummaryWriter(run_log_dir)
+# Ensure output directories exist before TensorBoard/checkpointing
+os.makedirs(config.tensorboard_dir, exist_ok=True)
+os.makedirs(config.checkpoint_dir, exist_ok=True)
 
-# Launch TensorBoard as a background process (points at parent dir to see all runs)
-TB_PORT = 6006
-tb_process = subprocess.Popen(
-    ["tensorboard", "--logdir", config.tensorboard_dir, "--port", str(TB_PORT)],
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
-)
+# TensorBoard writer — optionally restrict to a single latest run
+if getattr(config, "tensorboard_latest_only", False):
+    # Use a fixed "latest" directory and clear it each run
+    run_log_dir = os.path.join(config.tensorboard_dir, "latest")
+    if os.path.exists(run_log_dir):
+        shutil.rmtree(run_log_dir)
+    os.makedirs(run_log_dir, exist_ok=True)
+    tb_logdir = run_log_dir
+else:
+    # Preserve historical runs using timestamped subdirectories
+    run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_log_dir = os.path.join(config.tensorboard_dir, run_name)
+    tb_logdir = config.tensorboard_dir
 
-def _cleanup_tensorboard():
-    tb_process.terminate()
-    tb_process.wait()
+try:
+    writer = SummaryWriter(run_log_dir)
+    TB_PORT = 6006
+    tb_process = subprocess.Popen(
+        ["tensorboard", "--logdir", tb_logdir, "--port", str(TB_PORT)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
-atexit.register(_cleanup_tensorboard)
-signal.signal(signal.SIGTERM, lambda sig, frame: (_cleanup_tensorboard(), exit(0)))
+    def _cleanup_tensorboard():
+        tb_process.terminate()
+        tb_process.wait()
 
-print(f"TensorBoard started on: \033[4mhttp://localhost:{TB_PORT}\033[0m")
+    atexit.register(_cleanup_tensorboard)
+    signal.signal(signal.SIGTERM, lambda sig, frame: (_cleanup_tensorboard(), exit(0)))
+    print(f"TensorBoard started on: \033[4mhttp://localhost:{TB_PORT}\033[0m")
+except OSError as e:
+    # Fallback when log dir is unwritable (e.g. read-only filesystem)
+    class _NoOpWriter:
+        def add_scalar(self, *args, **kwargs): pass
+        def flush(self): pass
+        def close(self): pass
+    writer = _NoOpWriter()
+    tb_process = None
+    print(f"TensorBoard disabled (could not create log dir: {e})")
 
 # Training
 print("Starting training...")
@@ -223,7 +261,7 @@ try:
             eval_syndromes, eval_targets = data_loader.get_batch(
                 EVAL_SHOTS, epoch=epoch, total_epochs=TOTAL_EPOCHS
             )
-            eval_loss, eval_mean_acc, eval_final_acc = eval_step(
+            eval_loss, eval_mean_acc, eval_final_acc, pred_mean, pred_std, frac_pos = eval_step(
                 params, eval_rng, eval_syndromes, eval_targets
             )
             eval_loss_scalar = float(eval_loss)
@@ -231,11 +269,15 @@ try:
             eval_final_scalar = float(eval_final_acc)
             print(
                 f"  [EVAL] Epoch {epoch}: Loss = {eval_loss_scalar:.4f}, "
-                f"Mean Acc = {eval_mean_scalar:.4f}, Final Acc = {eval_final_scalar:.4f}"
+                f"Mean Acc = {eval_mean_scalar:.4f}, Final Acc = {eval_final_scalar:.4f}, "
+                f"Pred μ={float(pred_mean):.4f} σ={float(pred_std):.4f} pos={float(frac_pos):.3f}"
             )
             writer.add_scalar("eval/loss", eval_loss_scalar, epoch)
             writer.add_scalar("eval/mean_accuracy", eval_mean_scalar, epoch)
             writer.add_scalar("eval/final_accuracy", eval_final_scalar, epoch)
+            writer.add_scalar("eval/pred_prob_mean", float(pred_mean), epoch)
+            writer.add_scalar("eval/pred_prob_std", float(pred_std), epoch)
+            writer.add_scalar("eval/pred_frac_positive", float(frac_pos), epoch)
             writer.flush()
             
             # Save best model
@@ -253,9 +295,10 @@ except KeyboardInterrupt:
 
 writer.close()
 print("Done.")
-print(f"TensorBoard still running at: \033[4mhttp://localhost:{TB_PORT}\033[0m")
-print("Press Ctrl+C to stop.")
-try:
-    tb_process.wait()
-except KeyboardInterrupt:
-    pass
+if tb_process is not None:
+    print(f"TensorBoard still running at: \033[4mhttp://localhost:{TB_PORT}\033[0m")
+    print("Press Ctrl+C to stop.")
+    try:
+        tb_process.wait()
+    except KeyboardInterrupt:
+        pass

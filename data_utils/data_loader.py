@@ -25,10 +25,9 @@ class CurriculumDataLoader:
         self.dem_min_f = 0.5
         self.dem_max_f = 1.0
         
-        # SI1000 Curriculum: Physical error p from 0.001 to 0.005 (Example range)
-        # Note: Adjust these p values based on what your generate_SI1000_data expects
-        self.si_min_p = 0.001
-        self.si_max_p = 0.005
+        # SI1000 Curriculum: Physical error rate range (configurable)
+        self.si_min_p = getattr(config, 'si_min_p', 0.003)
+        self.si_max_p = getattr(config, 'si_max_p', 0.008)
 
     def _get_difficulty_params(self, progress):
         """
@@ -63,14 +62,19 @@ class CurriculumDataLoader:
             )
             
         elif self.mode == "DEM":
-            # DEM returns 2 channels: Meas, Event (Leakage is 0)
+            # DEM returns 3 objects: events, measurements, labels
             # Ensure generate_pij_DEM_data accepts 'scale_factor' as discussed
-            p1, e1, labels = generate_pij_DEM_data(
+            events, measurements, labels = generate_pij_DEM_data(
                 d=self.d, rounds=self.rounds, shots=batch_size, scale_factor=curr_f
             )
             
+            # The model expects 4 channels: Meas, Event, LeakMeas, LeakEvent
+            # For DEM data, leakage is not modelled, so we set Leak channels to zero
+            # We map Measurements (p1) to measurements, and Events (e1) to events
+            p1 = measurements
+            e1 = events
+            
             # Create dummy leakage channels (Zeros) for DEM data
-            # (Leakage is not simulated in standard Stim DEMs, but valid inputs are needed)
             p2 = np.zeros_like(p1)
             e2 = np.zeros_like(e1)
             
@@ -79,25 +83,32 @@ class CurriculumDataLoader:
 
         # 3. Reshape and Format (Standardize Shape)
         # We process the flattened output into (Batch, Rounds, Stabilizers)
-        limit = self.rounds * self.num_stabilizers
+        limit = (self.rounds + 1) * self.num_stabilizers
         
-        # Slice to ensure we only have the bulk rounds if generation creates extras
-        p1_in = p1[:, :limit].reshape(batch_size, self.rounds, self.num_stabilizers)
-        e1_in = e1[:, :limit].reshape(batch_size, self.rounds, self.num_stabilizers)
-        p2_in = p2[:, :limit].reshape(batch_size, self.rounds, self.num_stabilizers)
-        e2_in = e2[:, :limit].reshape(batch_size, self.rounds, self.num_stabilizers)
+        # Slice to ensure we only have the bulk rounds + final round
+        p1_in = p1[:, :limit].reshape(batch_size, self.rounds + 1, self.num_stabilizers)
+        e1_in = e1[:, :limit].reshape(batch_size, self.rounds + 1, self.num_stabilizers)
+        p2_in = p2[:, :limit].reshape(batch_size, self.rounds + 1, self.num_stabilizers)
+        e2_in = e2[:, :limit].reshape(batch_size, self.rounds + 1, self.num_stabilizers)
 
         # 4. Stack Channels
-        # Result: (Batch, Rounds, Stabilizers, 4)
+        # Result: (Batch, Rounds + 1, Stabilizers, 4)
         syndromes = np.stack([p1_in, e1_in, p2_in, e2_in], axis=-1)
         
-        # Ensure labels are (Batch, Rounds, 1) and float32
-        # SI1000: labels already (batch_size, rounds). DEM: (batch_size, 1) -> broadcast.
-        if labels.ndim == 1 or labels.shape[1] == 1:
+        # Ensure labels are (Batch, Rounds + 1, 1) and float32
+        # SI1000: labels originally (batch_size, rounds). We must duplicate the final label 
+        # so the prediction at step `rounds+1` targets the correct final logical observable.
+        if self.mode == "SI1000":
+            # Append the last column again to make it rounds + 1
+            last_col = labels[:, -1:]
+            labels = np.concatenate([labels, last_col], axis=-1)
+        else:
+            # DEM: (batch_size, 1) -> broadcast to (batch_size, rounds + 1)
             labels = np.broadcast_to(
                 np.asarray(labels).reshape(batch_size, -1)[:, 0:1],
-                (batch_size, self.rounds)
+                (batch_size, self.rounds + 1)
             ).copy()
-        targets = labels.astype(np.float32).reshape(batch_size, self.rounds, 1)
+            
+        targets = labels.astype(np.float32).reshape(batch_size, self.rounds + 1, 1)
 
         return jnp.array(syndromes), jnp.array(targets)

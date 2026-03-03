@@ -21,11 +21,11 @@ class CycleArchitecture(hk.Module):
             num_layers=self.num_layers,
             model_dim=self.output_size,
         )
-        d_new, aux_loss = rnn_core(s, d_old)
+        d_new = rnn_core(s, d_old)
 
         # Final readout network
         readout = ReadoutHead()
         final_logit = readout(d_new)
 
-        # Return state, prediction, and MoE load-balancing auxiliary loss
-        return d_new, final_logit, aux_loss
+        # Return state and prediction
+        return d_new, final_logit

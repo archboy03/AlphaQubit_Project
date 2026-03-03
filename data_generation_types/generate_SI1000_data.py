@@ -99,13 +99,21 @@ def generate_SI1000_training_data(p: np.float32, d=config.code_distance, rounds=
     post_1[:, -num_final_qubits:] = (post_1[:, -num_final_qubits:] > 0.5).astype(np.float32)
     post_2[:, -num_final_qubits:] = (post_2[:, -num_final_qubits:] > 0.5).astype(np.float32)
 
-    # Now convert the data qubits into stabilizer measurements
+    # Now convert the data qubits into stabilizer measurements (shape: shots, d^2-1)
     final_stabilizers_1 = calculate_final_round_stabilizers(post_1[:, -num_final_qubits:], d)
     final_stabilizers_2 = np.zeros((shots, num_final_qubits-1))
+
+    # Calculate final events: soft_xor between final_stabilizers and the last bulk round
+    final_events_1 = noise_model.soft_xor(final_stabilizers_1, bulk_post_1[:, -1, :])
+    final_events_2 = noise_model.soft_xor(final_stabilizers_2, bulk_post_2[:, -1, :])
 
     # Replace the last num_final_qubits columns with the num_final_qubits - 1 stabilizer values
     post_1 = np.concatenate([post_1[:, :-num_final_qubits], final_stabilizers_1], axis=1).astype(np.float32)
     post_2 = np.concatenate([post_2[:, :-num_final_qubits], final_stabilizers_2], axis=1).astype(np.float32)
+    
+    # Also append the final events to the events arrays
+    events_1 = np.concatenate([events_1, final_events_1], axis=1).astype(np.float32)
+    events_2 = np.concatenate([events_2, final_events_2], axis=1).astype(np.float32)
 
     return post_1, events_1, post_2, events_2, logical_errors
 
